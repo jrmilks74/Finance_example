@@ -1,0 +1,956 @@
+# ---- Packages ----
+library(shiny)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(plotly)
+library(scales)
+library(fpp3)
+library(lubridate)
+library(kableExtra)
+library(htmltools)
+library(readxl)
+
+options(scipen = 999)
+options(shiny.maxRequestSize = 15 * 1024^2)
+
+# ---- Configuration ----
+REQUIRED_COLUMNS <- c("Date", "Tithe", "Income", "Expenses")
+MINIMUM_FORECAST_MONTHS <- 24
+GROWTH_GAP_THRESHOLD <- 0.03
+
+# ---- Formatting and calculation helpers ----
+safe_sum <- function(x) {
+        if (length(x) == 0 || all(is.na(x))) NA_real_ else sum(x, na.rm = TRUE)
+}
+
+safe_change <- function(current, prior) {
+        if (is.na(current) || is.na(prior) || prior == 0) NA_real_ else current / prior - 1
+}
+
+fmt_money <- function(x) {
+        ifelse(is.na(x), "—", dollar(x, accuracy = 1))
+}
+
+fmt_percent <- function(x) {
+        ifelse(is.na(x), "—", percent(x, accuracy = 0.1))
+}
+
+roll_sum <- function(x, width = 12) {
+        vapply(seq_along(x), function(i) {
+                if (i < width) return(NA_real_)
+                window <- x[(i - width + 1):i]
+                if (anyNA(window)) NA_real_ else sum(window)
+        }, numeric(1))
+}
+
+roll_mean <- function(x, width = 12) {
+        roll_sum(x, width) / width
+}
+
+month_sequence <- function(first_ym, last_ym) {
+        seq(as.Date(first_ym), as.Date(last_ym), by = "1 month") |> yearmonth()
+}
+
+complete_months <- function(finances) {
+        tibble(YM = month_sequence(min(finances$YM), max(finances$YM))) |>
+                left_join(finances, by = "YM") |>
+                arrange(YM)
+}
+
+metric_label <- function(category) {
+        switch(
+                category,
+                "Tithe" = "Tithe",
+                "Income" = "Church budget income",
+                "Expenses" = "Expenses",
+                "Deficit" = "Operating surplus/deficit"
+        )
+}
+
+# ---- Uploaded-data parsing and validation ----
+parse_financial_date <- function(x) {
+        if (inherits(x, "Date")) return(x)
+        if (inherits(x, c("POSIXct", "POSIXlt"))) return(as.Date(x))
+        
+        if (is.numeric(x)) {
+                # Excel's standard date origin. readxl normally converts formatted
+                # date cells itself, but this also handles numeric date exports.
+                return(as.Date(x, origin = "1899-12-30"))
+        }
+        
+        text <- trimws(as.character(x))
+        valid_iso_shape <- str_detect(text, "^\\d{4}-\\d{2}-\\d{2}$")
+        parsed <- rep(as.Date(NA), length(text))
+        parsed[valid_iso_shape] <- suppressWarnings(as.Date(
+                text[valid_iso_shape],
+                format = "%Y-%m-%d"
+        ))
+        parsed
+}
+
+parse_financial_number <- function(x) {
+        if (is.numeric(x)) return(as.numeric(x))
+        
+        text <- trimws(as.character(x))
+        parenthetical_negative <- str_detect(text, "^\\s*\\(.*\\)\\s*$")
+        parsed <- suppressWarnings(parse_number(text, na = c("", "NA", "N/A", "-")))
+        parsed[parenthetical_negative & !is.na(parsed)] <-
+                -abs(parsed[parenthetical_negative & !is.na(parsed)])
+        parsed
+}
+
+canonicalize_columns <- function(data) {
+        original_names <- names(data)
+        normalized_names <- str_to_lower(str_squish(original_names))
+        required_normalized <- str_to_lower(REQUIRED_COLUMNS)
+        
+        if (anyDuplicated(normalized_names)) {
+                duplicated_names <- unique(original_names[duplicated(normalized_names)])
+                stop("Duplicate column names were found: ", paste(duplicated_names, collapse = ", "))
+        }
+        
+        missing_columns <- REQUIRED_COLUMNS[!required_normalized %in% normalized_names]
+        if (length(missing_columns) > 0) {
+                stop(
+                        "Missing required columns: ", paste(missing_columns, collapse = ", "),
+                        ". Required columns are Date, Tithe, Income, and Expenses."
+                )
+        }
+        
+        selected <- data[, match(required_normalized, normalized_names), drop = FALSE]
+        names(selected) <- REQUIRED_COLUMNS
+        as_tibble(selected)
+}
+
+read_financial_file <- function(path, original_name, sheet = NULL) {
+        extension <- str_to_lower(tools::file_ext(original_name))
+        selected_sheet <- if (is.null(sheet) || !nzchar(sheet)) 1 else sheet
+        
+        raw <- switch(
+                extension,
+                "csv" = read_csv(
+                        path,
+                        show_col_types = FALSE,
+                        na = c("", "NA", "N/A")
+                ),
+                "xlsx" = read_excel(path, sheet = selected_sheet),
+                "xls" = read_excel(path, sheet = selected_sheet),
+                stop("Unsupported file type. Upload a CSV, XLSX, or XLS file.")
+        )
+        
+        if (nrow(raw) == 0) stop("The uploaded file contains no data rows.")
+        
+        finances <- canonicalize_columns(raw) |>
+                mutate(
+                        SourceRow = row_number() + 1L,
+                        Date = parse_financial_date(Date),
+                        Tithe = parse_financial_number(Tithe),
+                        Income = parse_financial_number(Income),
+                        Expenses = parse_financial_number(Expenses)
+                )
+        
+        bad_date_rows <- finances |>
+                filter(is.na(Date)) |>
+                pull(SourceRow)
+        
+        if (length(bad_date_rows) > 0) {
+                stop(
+                        "Date values must be valid yyyy-mm-dd dates, such as 2026-07-01. Check source row(s): ",
+                        paste(head(bad_date_rows, 12), collapse = ", "),
+                        if (length(bad_date_rows) > 12) ", and others" else "",
+                        "."
+                )
+        }
+        
+        bad_number_rows <- finances |>
+                filter(if_any(c(Tithe, Income, Expenses), is.na)) |>
+                pull(SourceRow)
+        
+        if (length(bad_number_rows) > 0) {
+                stop(
+                        "Missing or unrecognized financial values were found in source row(s): ",
+                        paste(head(bad_number_rows, 12), collapse = ", "),
+                        if (length(bad_number_rows) > 12) ", and others" else "",
+                        "."
+                )
+        }
+        
+        finances <- finances |>
+                mutate(YM = yearmonth(Date)) |>
+                arrange(YM)
+        
+        duplicate_months <- finances |>
+                count(YM) |>
+                filter(n > 1)
+        
+        if (nrow(duplicate_months) > 0) {
+                stop(
+                        "More than one row was found for: ",
+                        paste(as.character(duplicate_months$YM), collapse = ", "),
+                        ". Combine each month into one total before uploading."
+                )
+        }
+        
+        if (nrow(finances) < MINIMUM_FORECAST_MONTHS) {
+                stop(
+                        "At least ", MINIMUM_FORECAST_MONTHS,
+                        " monthly rows are required for dependable forecasting. This file has ",
+                        nrow(finances), "."
+                )
+        }
+        
+        expected_months <- month_sequence(min(finances$YM), max(finances$YM))
+        missing_months <- base::setdiff(
+                as.character(expected_months),
+                as.character(finances$YM)
+        )
+        
+        finances <- finances |>
+                mutate(
+                        Date = as.Date(YM),
+                        Year = year(Date),
+                        Month = month(Date),
+                        Deficit = Income - Expenses
+                ) |>
+                select(Date, YM, Year, Month, Tithe, Income, Expenses, Deficit)
+        
+        list(
+                finances = finances,
+                missing_months = missing_months,
+                source_name = original_name,
+                sheet = sheet
+        )
+}
+
+# ---- Forecast helpers ----
+make_tsibble <- function(finances, category) {
+        finances |>
+                select(Date = YM, Current = all_of(category)) |>
+                as_tsibble(index = Date) |>
+                fill_gaps()
+}
+
+fit_forecast <- function(tsb, horizon_months = 12, category) {
+        # model() normally converts fitting errors into a <NULL model>, which
+        # makes the useful error appear only later during forecasting. Running
+        # with .safely = FALSE lets us catch the original fitting error here and
+        # use a documented fallback. Exact estimation also avoids the default
+        # CSS approximation used for series longer than 150 observations; that
+        # approximation can be sensitive to platform-specific numerical code.
+        fit_error_message <- function(e) {
+                message <- trimws(conditionMessage(e))
+                if (nzchar(message)) message else paste(class(e), collapse = "/")
+        }
+        
+        fit <- tryCatch(
+                tsb |>
+                        model(
+                                arima = ARIMA(
+                                        Current,
+                                        stepwise = TRUE,
+                                        approximation = FALSE
+                                ),
+                                .safely = FALSE
+                        ),
+                error = function(e) {
+                        warning(
+                                "Exact ", category,
+                                " ARIMA failed; using ETS. Details: ",
+                                fit_error_message(e),
+                                call. = FALSE
+                        )
+                        NULL
+                }
+        )
+        
+        if (is.null(fit)) {
+                fit <- tsb |>
+                        model(
+                                fallback = ETS(Current),
+                                .safely = FALSE
+                        )
+                method <- "ETS fallback"
+        } else {
+                method <- "exact ARIMA"
+        }
+        
+        fc <- forecast(fit, h = horizon_months)
+        
+        list(fit = fit, fc = fc, method = method)
+}
+
+period_totals <- function(finances, latest_ym) {
+        current_year <- year(as.Date(latest_ym))
+        latest_month <- month(as.Date(latest_ym))
+        
+        summarize_period <- function(data) {
+                tibble(
+                        Tithe = safe_sum(data$Tithe),
+                        Income = safe_sum(data$Income),
+                        Expenses = safe_sum(data$Expenses),
+                        Net = safe_sum(data$Deficit)
+                )
+        }
+        
+        latest <- finances |> filter(YM == latest_ym) |> summarize_period()
+        latest_prior <- finances |> filter(YM == latest_ym - 12) |> summarize_period()
+        
+        ytd <- finances |>
+                filter(Year == current_year, Month <= latest_month) |>
+                summarize_period()
+        ytd_prior <- finances |>
+                filter(Year == current_year - 1, Month <= latest_month) |>
+                summarize_period()
+        
+        rolling_12 <- finances |>
+                filter(YM > latest_ym - 12, YM <= latest_ym) |>
+                summarize_period()
+        rolling_12_prior <- finances |>
+                filter(YM > latest_ym - 24, YM <= latest_ym - 12) |>
+                summarize_period()
+        
+        list(
+                latest = latest,
+                latest_prior = latest_prior,
+                ytd = ytd,
+                ytd_prior = ytd_prior,
+                rolling_12 = rolling_12,
+                rolling_12_prior = rolling_12_prior
+        )
+}
+
+year_end_total <- function(finances, category) {
+        latest_ym <- max(finances$YM)
+        current_year <- year(as.Date(latest_ym))
+        last_month <- month(as.Date(latest_ym))
+        actual_ytd <- finances |>
+                filter(Year == current_year) |>
+                pull(all_of(category)) |>
+                safe_sum()
+        
+        if (last_month == 12) {
+                return(list(actual = actual_ytd, remaining = 0, total = actual_ytd))
+        }
+        
+        tsb <- make_tsibble(finances, category)
+        model <- fit_forecast(tsb, horizon_months = 12, category = category)
+        forecast_remaining <- model$fc |>
+                as_tibble() |>
+                transmute(YM = Date, Forecast = .mean) |>
+                filter(year(as.Date(YM)) == current_year) |>
+                pull(Forecast) |>
+                safe_sum()
+        
+        list(
+                actual = actual_ytd,
+                remaining = forecast_remaining,
+                total = actual_ytd + forecast_remaining
+        )
+}
+
+# ---- Shiny server ----
+function(input, output, session) {
+        output$app_title <- renderUI({
+                title <- str_squish(input$church_name)
+                if (!nzchar(title)) title <- "Church Finance Dashboard"
+                h2(title, class = "app-title")
+        })
+        
+        output$sheet_selector <- renderUI({
+                req(input$finance_file)
+                extension <- str_to_lower(tools::file_ext(input$finance_file$name))
+                if (!extension %in% c("xlsx", "xls")) return(NULL)
+                
+                sheets <- tryCatch(
+                        excel_sheets(input$finance_file$datapath),
+                        error = function(e) character()
+                )
+                if (length(sheets) == 0) return(NULL)
+                
+                selectInput(
+                        "excel_sheet",
+                        "Worksheet",
+                        choices = sheets,
+                        selected = sheets[1]
+                )
+        })
+        
+        upload_result <- reactive({
+                req(input$finance_file)
+                extension <- str_to_lower(tools::file_ext(input$finance_file$name))
+                sheet <- NULL
+                if (extension %in% c("xlsx", "xls")) {
+                        req(input$excel_sheet)
+                        sheet <- input$excel_sheet
+                }
+                
+                tryCatch(
+                        read_financial_file(
+                                path = input$finance_file$datapath,
+                                original_name = input$finance_file$name,
+                                sheet = sheet
+                        ),
+                        error = function(e) {
+                                structure(
+                                        list(message = conditionMessage(e)),
+                                        class = "upload_error"
+                                )
+                        }
+                )
+        })
+        
+        finances <- reactive({
+                result <- upload_result()
+                validate(need(
+                        !inherits(result, "upload_error"),
+                        result$message
+                ))
+                result$finances
+        })
+        
+        latest_ym <- reactive(max(finances()$YM))
+        current_year <- reactive(year(as.Date(latest_ym())))
+        summaries <- reactive(period_totals(finances(), latest_ym()))
+        
+        board_outlook <- reactive({
+                income <- year_end_total(finances(), "Income")
+                expenses <- year_end_total(finances(), "Expenses")
+                list(
+                        income = income,
+                        expenses = expenses,
+                        net = income$total - expenses$total
+                )
+        })
+        
+        metric_card <- function(label, value, detail, status = "") {
+                div(
+                        class = paste("metric-card", status),
+                        div(label, class = "metric-label"),
+                        div(value, class = "metric-value"),
+                        div(detail, class = "metric-detail")
+                )
+        }
+        
+        net_status <- function(value) {
+                if (is.na(value)) "review" else if (value < 0) "adverse" else "good"
+        }
+        
+        output$download_template <- downloadHandler(
+                filename = function() "church_finance_template.csv",
+                content = function(file) {
+                        template_dates <- seq(
+                                floor_date(Sys.Date(), "month") %m-% months(35),
+                                floor_date(Sys.Date(), "month"),
+                                by = "1 month"
+                        )
+                        tibble(
+                                Date = format(template_dates, "%Y-%m-%d"),
+                                Tithe = NA_real_,
+                                Income = NA_real_,
+                                Expenses = NA_real_
+                        ) |>
+                                write_csv(file, na = "")
+                }
+        )
+        
+        output$upload_message <- renderUI({
+                if (is.null(input$finance_file)) {
+                        return(tags$small(
+                                "Upload at least 24 monthly rows. Google Sheets can be downloaded as Excel or CSV."
+                        ))
+                }
+                
+                result <- upload_result()
+                if (inherits(result, "upload_error")) {
+                        div(
+                                class = "error-box",
+                                icon("circle-exclamation"),
+                                strong(" Upload problem: "),
+                                result$message
+                        )
+                } else {
+                        tags$span(
+                                icon("circle-check"),
+                                paste(
+                                        nrow(result$finances),
+                                        "monthly rows loaded from",
+                                        result$source_name
+                                ),
+                                style = "color:#2a7f62; font-weight:600;"
+                        )
+                }
+        })
+        
+        output$data_as_of <- renderUI({
+                if (is.null(input$finance_file)) {
+                        return(tagList(strong("No financial data loaded."), " Upload a file to begin."))
+                }
+                
+                result <- upload_result()
+                if (inherits(result, "upload_error")) {
+                        return(tagList(strong("Data unavailable:"), " correct the upload problem above."))
+                }
+                
+                tagList(
+                        strong("Data through: "),
+                        format(as.Date(latest_ym()), "%B %Y"),
+                        tags$span(" · "),
+                        strong("Source: "),
+                        result$source_name,
+                        if (!is.null(result$sheet)) paste0(" · Worksheet: ", result$sheet)
+                )
+        })
+        
+        output$data_quality <- renderUI({
+                if (is.null(input$finance_file)) return(NULL)
+                result <- upload_result()
+                if (inherits(result, "upload_error")) return(NULL)
+                
+                issues <- character()
+                if (length(result$missing_months) > 0) {
+                        issues <- c(issues, paste(length(result$missing_months), "missing month(s)"))
+                }
+                
+                latest_gap <- as.integer(yearmonth(Sys.Date()) - latest_ym())
+                if (!is.na(latest_gap) && latest_gap > 1) issues <- c(issues, "financial data may be stale")
+                
+                if (length(issues) == 0) {
+                        tags$span(
+                                icon("circle-check"),
+                                "Data checks passed",
+                                style = "color:#2a7f62; font-weight:600; float:right;"
+                        )
+                } else {
+                        tags$span(
+                                icon("triangle-exclamation"),
+                                paste(issues, collapse = " · "),
+                                style = "color:#9c6515; font-weight:600; float:right;"
+                        )
+                }
+        })
+        
+        output$kpi_latest_net <- renderUI({
+                s <- summaries()
+                change <- s$latest$Net - s$latest_prior$Net
+                metric_card(
+                        "Latest-month operating result",
+                        fmt_money(s$latest$Net),
+                        paste(fmt_money(change), "versus the same month last year"),
+                        net_status(s$latest$Net)
+                )
+        })
+        
+        output$kpi_ytd_net <- renderUI({
+                s <- summaries()
+                change <- s$ytd$Net - s$ytd_prior$Net
+                metric_card(
+                        "Year-to-date operating result",
+                        fmt_money(s$ytd$Net),
+                        paste(fmt_money(change), "versus prior-year YTD"),
+                        net_status(s$ytd$Net)
+                )
+        })
+        
+        output$kpi_r12_net <- renderUI({
+                s <- summaries()
+                change <- s$rolling_12$Net - s$rolling_12_prior$Net
+                metric_card(
+                        "Rolling 12-month result",
+                        fmt_money(s$rolling_12$Net),
+                        paste(fmt_money(change), "versus the previous 12 months"),
+                        net_status(s$rolling_12$Net)
+                )
+        })
+        
+        output$kpi_year_end <- renderUI({
+                outlook <- board_outlook()
+                metric_card(
+                        "Forecast year-end result",
+                        fmt_money(outlook$net),
+                        "Model estimate based on data reported to date; not a budget",
+                        net_status(outlook$net)
+                )
+        })
+        
+        output$performance_summary <- renderUI({
+                s <- summaries()
+                
+                make_row <- function(period, current, prior, comparison_label) {
+                        tibble(
+                                Period = period,
+                                Tithe = current$Tithe,
+                                Income = current$Income,
+                                Expenses = current$Expenses,
+                                `Surplus/Deficit` = current$Net,
+                                `Net change` = current$Net - prior$Net,
+                                Comparison = comparison_label
+                        )
+                }
+                
+                table_data <- bind_rows(
+                        make_row("Latest month", s$latest, s$latest_prior, "Same month last year"),
+                        make_row("Year to date", s$ytd, s$ytd_prior, "Prior-year YTD"),
+                        make_row("Rolling 12 months", s$rolling_12, s$rolling_12_prior, "Previous 12 months")
+                ) |>
+                        mutate(across(c(Tithe, Income, Expenses, `Surplus/Deficit`, `Net change`), fmt_money))
+                
+                HTML(
+                        kbl(table_data, align = c("l", "r", "r", "r", "r", "r", "l")) |>
+                                kable_styling(
+                                        bootstrap_options = c("striped", "hover", "responsive"),
+                                        full_width = TRUE
+                                ) |>
+                                column_spec(1, bold = TRUE)
+                )
+        })
+        
+        output$attention_items <- renderUI({
+                fin <- finances()
+                s <- summaries()
+                alerts <- character()
+                
+                missing_months <- upload_result()$missing_months
+                if (length(missing_months) > 0) {
+                        missing_display <- paste(head(missing_months, 4), collapse = ", ")
+                        alerts <- c(
+                                alerts,
+                                paste0("Confirm missing monthly records: ", missing_display,
+                                       if (length(missing_months) > 4) " and others." else ".")
+                        )
+                }
+                
+                recent_net <- fin |>
+                        arrange(YM) |>
+                        slice_tail(n = 3) |>
+                        pull(Deficit)
+                if (length(recent_net) == 3 && !anyNA(recent_net) && all(recent_net < 0)) {
+                        alerts <- c(alerts, "The church has reported an operating deficit for three consecutive months.")
+                }
+                
+                if (!is.na(s$rolling_12$Net) && s$rolling_12$Net < 0) {
+                        alerts <- c(alerts, "The rolling 12-month operating result is a deficit.")
+                }
+                
+                income_growth <- safe_change(s$rolling_12$Income, s$rolling_12_prior$Income)
+                expense_growth <- safe_change(s$rolling_12$Expenses, s$rolling_12_prior$Expenses)
+                if (!is.na(income_growth) && !is.na(expense_growth) &&
+                    expense_growth - income_growth > GROWTH_GAP_THRESHOLD) {
+                        alerts <- c(
+                                alerts,
+                                paste0(
+                                        "Rolling expenses grew ", fmt_percent(expense_growth),
+                                        " while income grew ", fmt_percent(income_growth), "."
+                                )
+                        )
+                }
+                
+                if (!is.na(board_outlook()$net) && board_outlook()$net < 0) {
+                        alerts <- c(alerts, "The current model projects a year-end operating deficit.")
+                }
+                
+                if (length(alerts) == 0) {
+                        p("No automated attention flags were triggered. Review the underlying financial statements before drawing conclusions.")
+                } else {
+                        tagList(
+                                tags$ul(class = "attention-list", lapply(alerts, tags$li)),
+                                tags$small("Flags identify conditions to review; they do not establish that a problem exists.")
+                        )
+                }
+        })
+        
+        output$cumulative_net_graph <- renderPlotly({
+                fin <- finances() |>
+                        group_by(Year) |>
+                        arrange(Month, .by_group = TRUE) |>
+                        mutate(CumulativeNet = cumsum(replace_na(Deficit, 0))) |>
+                        ungroup() |>
+                        filter(Year >= current_year() - 4) |>
+                        mutate(Year = factor(Year))
+                
+                p <- ggplot(fin, aes(Month, CumulativeNet, colour = Year, group = Year)) +
+                        geom_hline(yintercept = 0, colour = "grey65") +
+                        geom_line(linewidth = 1) +
+                        geom_point(size = 1.5) +
+                        scale_x_continuous(breaks = 1:12, labels = month.abb) +
+                        scale_y_continuous(labels = label_dollar()) +
+                        labs(x = NULL, y = "Cumulative surplus/deficit", colour = "Year") +
+                        theme_minimal()
+                
+                ggplotly(p, tooltip = c("colour", "x", "y"))
+        })
+        
+        output$rolling_12_graph <- renderPlotly({
+                rolling <- complete_months(finances()) |>
+                        mutate(
+                                Income = roll_sum(Income),
+                                Expenses = roll_sum(Expenses),
+                                `Surplus/Deficit` = Income - Expenses
+                        ) |>
+                        select(Date = YM, Income, Expenses, `Surplus/Deficit`) |>
+                        pivot_longer(-Date, names_to = "Measure", values_to = "Amount")
+                
+                p <- ggplot(rolling, aes(as.Date(Date), Amount, colour = Measure)) +
+                        geom_hline(yintercept = 0, colour = "grey65") +
+                        geom_line(linewidth = 0.9, na.rm = TRUE) +
+                        scale_y_continuous(labels = label_dollar()) +
+                        scale_colour_manual(values = c(
+                                "Income" = "#2a7f62",
+                                "Expenses" = "#b23a48",
+                                "Surplus/Deficit" = "#376996"
+                        )) +
+                        labs(x = NULL, y = "Rolling 12-month total", colour = NULL) +
+                        theme_minimal()
+                
+                ggplotly(p, tooltip = c("colour", "x", "y"))
+        })
+        
+        history_data <- reactive({
+                complete_months(finances()) |>
+                        transmute(
+                                Date = as.Date(YM),
+                                YM,
+                                Year = year(Date),
+                                Month = month(Date),
+                                Amount = .data[[input$history_category]]
+                        )
+        })
+        
+        output$monthly_history_graph <- renderPlotly({
+                df <- history_data() |>
+                        mutate(RollingAverage = roll_mean(Amount, 12))
+                
+                p <- ggplot(df, aes(Date)) +
+                        geom_line(aes(y = Amount, colour = "Monthly amount"), alpha = 0.45) +
+                        geom_line(aes(y = RollingAverage, colour = "12-month average"), linewidth = 1) +
+                        scale_y_continuous(labels = label_dollar()) +
+                        scale_colour_manual(values = c(
+                                "Monthly amount" = "#7b8794",
+                                "12-month average" = "#376996"
+                        )) +
+                        labs(
+                                x = NULL,
+                                y = "Dollars",
+                                colour = NULL
+                        ) +
+                        theme_minimal()
+                
+                ggplotly(p, tooltip = c("x", "y", "colour"))
+        })
+        
+        output$seasonal_graph <- renderPlotly({
+                df <- history_data()
+                cy <- current_year()
+                completed_reference_years <- df$Year |>
+                        unique() |>
+                        sort(decreasing = TRUE) |>
+                        keep(~ .x <= cy - 2) |>
+                        head(5)
+                
+                current_prior <- df |>
+                        filter(Year %in% c(cy, cy - 1)) |>
+                        mutate(Series = as.character(Year)) |>
+                        select(Month, Series, Amount)
+                
+                reference <- df |>
+                        filter(Year %in% completed_reference_years) |>
+                        group_by(Month) |>
+                        summarise(Amount = median(Amount, na.rm = TRUE), .groups = "drop") |>
+                        mutate(Series = "Earlier 5-year median")
+                
+                plot_data <- bind_rows(current_prior, reference) |>
+                        mutate(Series = factor(
+                                Series,
+                                levels = c("Earlier 5-year median", as.character(cy - 1), as.character(cy))
+                        ))
+                
+                series_colors <- setNames(
+                        c("#7b8794", "#0072b2", "#d55e00"),
+                        c("Earlier 5-year median", as.character(cy - 1), as.character(cy))
+                )
+                
+                p <- ggplot(plot_data, aes(Month, Amount, colour = Series, group = Series)) +
+                        geom_line(linewidth = 1) +
+                        geom_point(size = 1.5) +
+                        scale_x_continuous(breaks = 1:12, labels = month.abb) +
+                        scale_y_continuous(labels = label_dollar()) +
+                        scale_colour_manual(values = series_colors) +
+                        labs(x = NULL, y = "Monthly amount", colour = NULL) +
+                        theme_minimal()
+                
+                ggplotly(p, tooltip = c("colour", "x", "y"))
+        })
+        
+        output$annual_graph <- renderPlotly({
+                df <- history_data() |>
+                        filter(Year < current_year()) |>
+                        group_by(Year) |>
+                        summarise(Amount = safe_sum(Amount), .groups = "drop")
+                
+                p <- ggplot(df, aes(Year, Amount)) +
+                        geom_hline(yintercept = 0, colour = "grey70") +
+                        geom_line(colour = "#376996", linewidth = 0.9) +
+                        geom_point(colour = "#376996", size = 2) +
+                        scale_y_continuous(labels = label_dollar()) +
+                        labs(x = NULL, y = "Annual total") +
+                        theme_minimal()
+                
+                ggplotly(p, tooltip = c("x", "y"))
+        })
+        
+        selected_forecast_tsibble <- reactive({
+                make_tsibble(finances(), input$forecast_category)
+        })
+        
+        selected_forecast_model <- reactive({
+                fit_forecast(
+                        selected_forecast_tsibble(),
+                        horizon_months = 12,
+                        category = input$forecast_category
+                )
+        })
+        
+        output$forecast_graph <- renderPlot({
+                tsb <- selected_forecast_tsibble()
+                model <- selected_forecast_model()
+                
+                autoplot(model$fc, tsb) +
+                        scale_y_continuous(labels = label_dollar()) +
+                        labs(
+                                title = paste(metric_label(input$forecast_category), "forecast"),
+                                subtitle = paste0(
+                                        "Model: ", model$method,
+                                        ". Shaded areas are forecast uncertainty intervals."
+                                ),
+                                x = NULL,
+                                y = "Dollars"
+                        ) +
+                        theme_minimal()
+        })
+        
+        selected_year_end <- reactive({
+                year_end_total(finances(), input$forecast_category)
+        })
+        
+        output$forecast_summary <- renderTable({
+                summary <- selected_year_end()
+                tibble(
+                        Measure = c(
+                                "Actual year to date",
+                                "Forecast for remaining months",
+                                "Forecast full-year total"
+                        ),
+                        Amount = fmt_money(c(summary$actual, summary$remaining, summary$total))
+                )
+        }, rownames = FALSE, striped = TRUE)
+        
+        january_backtest <- reactive({
+                category <- input$forecast_category
+                cy <- current_year()
+                training_finances <- finances() |> filter(Year < cy)
+                validate(need(nrow(training_finances) >= 24, "At least two prior years are required."))
+                
+                training_tsb <- make_tsibble(training_finances, category)
+                model <- fit_forecast(training_tsb, horizon_months = 12, category = category)
+                
+                forecast_values <- model$fc |>
+                        as_tibble() |>
+                        transmute(Date = as.Date(Date), Forecast = .mean)
+                
+                actual_values <- finances() |>
+                        filter(Year == cy) |>
+                        transmute(Date, Actual = .data[[category]])
+                
+                left_join(forecast_values, actual_values, by = "Date")
+        })
+        
+        output$forecast_vs_actual <- renderPlotly({
+                df <- january_backtest()
+                
+                p <- ggplot(df, aes(Date)) +
+                        geom_line(aes(y = Forecast, colour = "January forecast"), linewidth = 0.9) +
+                        geom_point(aes(y = Forecast, colour = "January forecast"), size = 1.6) +
+                        geom_line(aes(y = Actual, colour = "Actual"), linewidth = 0.9, na.rm = TRUE) +
+                        geom_point(aes(y = Actual, colour = "Actual"), size = 1.8, na.rm = TRUE) +
+                        scale_y_continuous(labels = label_dollar()) +
+                        scale_colour_manual(values = c(
+                                "January forecast" = "#0072b2",
+                                "Actual" = "#d55e00"
+                        )) +
+                        labs(x = NULL, y = "Dollars", colour = NULL) +
+                        theme_minimal()
+                
+                ggplotly(p, tooltip = c("x", "y", "colour"))
+        })
+        
+        output$forecast_accuracy <- renderTable({
+                matched <- january_backtest() |>
+                        filter(!is.na(Actual), !is.na(Forecast))
+                
+                validate(need(nrow(matched) > 0, "No current-year actuals are available yet."))
+                
+                mae <- mean(abs(matched$Actual - matched$Forecast))
+                nonzero <- matched |> filter(Actual != 0)
+                mape <- if (nrow(nonzero) == 0) NA_real_ else
+                        mean(abs((nonzero$Actual - nonzero$Forecast) / nonzero$Actual))
+                bias <- mean(matched$Actual - matched$Forecast)
+                
+                tibble(
+                        Measure = c("Months compared", "Mean absolute error", "Mean absolute percentage error", "Average actual minus forecast"),
+                        Result = c(as.character(nrow(matched)), fmt_money(mae), fmt_percent(mape), fmt_money(bias))
+                )
+        }, rownames = FALSE, striped = TRUE)
+        
+        output$forecast_table <- renderTable({
+                selected_forecast_model()$fc |>
+                        hilo() |>
+                        as_tibble() |>
+                        transmute(
+                                Year = year(as.Date(Date)),
+                                Month = month(as.Date(Date), label = TRUE, abbr = TRUE),
+                                Forecast = fmt_money(.mean),
+                                `80% range` = as.character(`80%`),
+                                `95% range` = as.character(`95%`)
+                        )
+        }, rownames = FALSE, striped = TRUE)
+        
+        output$data_preview <- renderTable({
+                finances() |>
+                        arrange(Date) |>
+                        slice_tail(n = 12) |>
+                        transmute(
+                                Month = format(Date, "%B %Y"),
+                                Tithe = fmt_money(Tithe),
+                                Income = fmt_money(Income),
+                                Expenses = fmt_money(Expenses),
+                                `Surplus/Deficit` = fmt_money(Deficit)
+                        )
+        }, rownames = FALSE, striped = TRUE)
+        
+        output$validation_details <- renderUI({
+                fin <- finances()
+                missing <- upload_result()$missing_months
+                
+                tags$ul(
+                        tags$li(
+                                strong("Coverage: "),
+                                paste(
+                                        format(min(fin$Date), "%B %Y"),
+                                        "through",
+                                        format(max(fin$Date), "%B %Y")
+                                )
+                        ),
+                        tags$li(strong("Monthly rows: "), nrow(fin)),
+                        tags$li(
+                                strong("Missing months: "),
+                                if (length(missing) == 0) "None" else paste(missing, collapse = ", ")
+                        ),
+                        tags$li(strong("Duplicate months: "), "None"),
+                        tags$li(strong("Unrecognized or missing values: "), "None")
+                )
+        })
+}
