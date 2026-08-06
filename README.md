@@ -1,4 +1,4 @@
-# Reusable Church Finance Dashboard
+# Example Church Finance Dashboard
 
 This Shiny app accepts monthly church financial data from a CSV or Excel file and produces board-level summaries, historical comparisons, attention flags, and forecasts.
 
